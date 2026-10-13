@@ -20,7 +20,7 @@ COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
 COPY backend/ backend/
-COPY src/estateiq.json src/estateiq.json
+COPY src/nexora.json src/nexora.json
 COPY --from=frontend /app/dist /app/dist
 
 EXPOSE 10000
