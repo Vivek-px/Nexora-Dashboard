@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Nexora: open in Edge",
+      "type": "msedge",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "preLaunchTask": "Nexora: run all",
+      "webRoot": "${workspaceFolder}"
+    },
+    {
+      "name": "Nexora: open in Chrome",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "preLaunchTask": "Nexora: run all",
+      "webRoot": "${workspaceFolder}"
+    }
+  ]
+}

@@ -1,0 +1,865 @@
+diff --git a/.streamlit/config.toml b/.streamlit/config.toml
+index 4714154..4c3dbc5 100644
+--- a/.streamlit/config.toml
++++ b/.streamlit/config.toml
+@@ -1,9 +1,10 @@
+ [theme]
+-base = "light"
+-primaryColor = "#4338CA"
+-backgroundColor = "#F7F8FA"
+-secondaryBackgroundColor = "#FFFFFF"
+-textColor = "#172033"
++# Royal Indigo design system (see dashboard/theme.py for the full token set)
++base = "dark"
++primaryColor = "#315CE8"
++backgroundColor = "#17143B"
++secondaryBackgroundColor = "#252249"
++textColor = "#F3F0FF"
+ font = "sans serif"
+ 
+ [server]
+diff --git a/app.py b/app.py
+index ae98317..c3dcae5 100644
+--- a/app.py
++++ b/app.py
+@@ -6,6 +6,7 @@ from facility.area_registry import AREA_IDS
+ from dashboard.monthly_ui import inject_theme
+ from dashboard.three_area_data import DashboardData, ALL_AREAS
+ from dashboard.workspace import PAGES, navigate, render_page
++from dashboard.indi import render_indi
+ 
+ st.set_page_config(page_title='Nexora · Bhubaneswar Facility Intelligence', page_icon='🏢',
+     layout='wide', initial_sidebar_state='expanded')
+@@ -60,4 +61,5 @@ if selection == ALL_AREAS:
+     st.caption('All Areas preserves separate series. Shared operational baselines and identical hypothetical water demand are not added together or presented as independent observations.')
+ 
+ render_page(ROOT,data,selection,years,page)
++render_indi()
+ st.markdown(f'<div class="footer">Nexora · {escape(data.name(selection))} · {escape(page)}<br>Offline exploratory decision support · source records preserved · review findings are not hazard or compliance verdicts.</div>',unsafe_allow_html=True)
+diff --git a/dashboard/environmental_map.py b/dashboard/environmental_map.py
+index 04a127e..18cdae6 100644
+--- a/dashboard/environmental_map.py
++++ b/dashboard/environmental_map.py
+@@ -2,6 +2,7 @@
+ from html import escape
+ 
+ import plotly.graph_objects as go
++from dashboard import theme
+ 
+ 
+ def sample_label(row):
+@@ -22,10 +23,10 @@ def map_figure(frame, tiles=True):
+             texts.append('<br>'.join(escape(str(part), quote=True) for part in parts))
+         figure.add_trace(go.Scattermap(lat=located.latitude, lon=located.longitude, text=texts,
+             customdata=located[['observation_id']].values, mode='markers', name='Verified monitoring point',
+-            marker=dict(size=19, color='#0d9488'), hovertemplate='%{text}<extra></extra>'))
+-    figure.update_layout(map=dict(style='open-street-map' if tiles else 'white-bg',
++            marker=dict(size=19, color=theme.TEAL_SOFT), hovertemplate='%{text}<extra></extra>'))
++    figure.update_layout(map=dict(style=theme.map_style(tiles),
+         center=dict(lat=20.258611, lon=85.789444), zoom=12), height=370,
+-        margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor='white',
+-        font=dict(family='Inter, Segoe UI, sans-serif', color='#172b3a'),
+-        hoverlabel=dict(bgcolor='white', font=dict(color='#172b3a', size=12)), showlegend=False)
++        margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor=theme.MIDNIGHT,
++        font=dict(family='Inter, Segoe UI, sans-serif', color=theme.TEXT),
++        hoverlabel=theme.HOVER, showlegend=False)
+     return figure
+diff --git a/dashboard/geographic_intelligence.py b/dashboard/geographic_intelligence.py
+index 90faa36..fd0de8f 100644
+--- a/dashboard/geographic_intelligence.py
++++ b/dashboard/geographic_intelligence.py
+@@ -2,6 +2,7 @@
+ from html import escape
+ 
+ import plotly.graph_objects as go
++from dashboard import theme
+ 
+ from facility.area_registry import AREA_IDS
+ 
+@@ -27,10 +28,10 @@ def geographic_map(data, selection, years, tiles=True, revision=0):
+             mode='markers+text', text=[data.name(area)], textposition='top center',
+             customdata=[[area, hover]], name=data.name(area),
+             marker=dict(size=24 if area == selection else 17,
+-                        color='#d97706' if area == selection else '#0d9488'),
++                        color=theme.MARKER_SELECTED if area == selection else theme.MARKER_DEFAULT),
+             hovertemplate='%{customdata[1]}<extra></extra>'))
+-    figure.update_layout(map=dict(style='open-street-map' if tiles else 'white-bg',
++    figure.update_layout(map=dict(style=theme.map_style(tiles),
+         center=dict(lat=20.285, lon=85.824), zoom=11.5), height=490,
+         margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
+-        uirevision=f'{selection}-{revision}', hoverlabel=dict(bgcolor='white', font=dict(color='#172b3a')))
++        uirevision=f'{selection}-{revision}', hoverlabel=theme.HOVER, font=dict(color=theme.TEXT), paper_bgcolor=theme.MIDNIGHT)
+     return figure
+diff --git a/dashboard/indi.py b/dashboard/indi.py
+new file mode 100644
+index 0000000..6476527
+--- /dev/null
++++ b/dashboard/indi.py
+@@ -0,0 +1,303 @@
++"""Indi: the roaming Nexora companion, rendered as a presentation-only overlay.
++
++The component mounts a single floating layer into the Streamlit page (same-origin ``st.iframe``)
++and reacts to real interface events on existing elements: KPI cards, Plotly charts, the priority
++evidence review and the action queue. It only quotes text that is already on screen and never claims
++to have run analysis. No data, model or session state is read or modified.
++"""
++import json
++
++import streamlit as st
++
++from dashboard import theme
++
++_SCRIPT = r"""
++<script>
++(function () {
++  const P = window.parent, D = P.document;
++  if (!D || D.getElementById('indi-root')) return;  // already mounted for this browser session
++  const C = __TOKENS__;
++  const reduced = () => P.matchMedia('(prefers-reduced-motion: reduce)').matches;
++  const store = P.sessionStorage;
++  let quiet = store.getItem('indi-quiet') === '1';
++  let hidden = true, pos = {x: 40, y: 40}, anim = 0, target = null, lastMove = 0, bubbleOpen = false;
++
++  const css = D.createElement('style');
++  css.textContent = `
++  #indi-root{position:fixed;inset:0;pointer-events:none;z-index:999990;font-family:Inter,'Segoe UI',sans-serif}
++  #indi-bot{position:absolute;left:0;top:0;width:56px;height:60px;pointer-events:auto;cursor:pointer;border:0;background:none;padding:0;
++    filter:drop-shadow(0 6px 10px rgba(10,6,40,.5));transition:opacity 300ms ease,scale 320ms cubic-bezier(.2,.8,.3,1)}
++  #indi-bot.is-hidden{opacity:0;scale:.25;pointer-events:none}
++  #indi-bot svg{transform:rotate(var(--tilt,0deg));transition:transform 160ms ease-out}
++  #indi-bot.float svg{animation:indi-float 3.6s ease-in-out infinite}
++  #indi-bot.hop svg{animation:indi-hop 700ms ease-in-out 1}
++  #indi-bot:focus-visible{outline:2px solid ${C.CYAN};outline-offset:4px;border-radius:50%}
++  #indi-shadow{position:absolute;left:11px;bottom:-8px;width:34px;height:7px;border-radius:50%;background:radial-gradient(rgba(8,5,35,.55),transparent 70%)}
++  @keyframes indi-float{50%{transform:translateY(-4px)}}
++  @keyframes indi-hop{35%{transform:translateY(-8px) rotate(-5deg)}65%{transform:translateY(-3px) rotate(4deg)}}
++  #indi-bubble{position:absolute;left:0;top:0;width:270px;pointer-events:auto;background:${C.MIDNIGHT};border:1px solid rgba(169,155,255,.35);border-radius:12px;
++    padding:12px 13px;color:${C.TEXT};font-size:13px;line-height:1.45;box-shadow:0 14px 30px -12px rgba(6,4,30,.9);animation:indi-in 190ms ease-out}
++  @keyframes indi-in{from{opacity:0;translate:0 5px}to{opacity:1;translate:0 0}}
++  #indi-bubble .hd{display:flex;align-items:center;gap:8px;margin-bottom:4px}
++  #indi-bubble .nm{font-size:10px;font-weight:700;letter-spacing:.14em;color:${C.ORCHID_SOFT}}
++  #indi-bubble .x{margin-left:auto;background:none;border:0;color:${C.MUTED};cursor:pointer;font-size:15px;line-height:1;padding:2px 4px;border-radius:6px}
++  #indi-bubble .x:hover{color:#fff;background:rgba(255,255,255,.08)}
++  #indi-bubble .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
++  #indi-bubble .chip{border:1px solid rgba(106,140,240,.55);background:rgba(49,92,232,.22);color:#fff;border-radius:999px;padding:4px 10px;font-size:11px;cursor:pointer;transition:background-color 200ms}
++  #indi-bubble .chip:hover{background:rgba(49,92,232,.45)}
++  #indi-bubble .ft{margin-top:10px;font-size:10.5px;color:${C.DIM};display:flex;justify-content:space-between}
++  #indi-bubble .ft button{background:none;border:0;color:${C.MUTED};cursor:pointer;font-size:10.5px;padding:0}
++  #indi-bubble .ft button:hover{color:#fff}
++  #indi-tail{position:absolute;width:10px;height:10px;background:${C.MIDNIGHT};transform:rotate(45deg)}
++  .brand-mark{cursor:pointer;position:relative}
++  .brand-mark::after{content:"";position:absolute;top:-3px;right:-3px;width:8px;height:8px;border-radius:50%;background:${C.CYAN};box-shadow:0 0 0 2px ${C.INDIGO}}
++  @media (prefers-reduced-motion: reduce){#indi-bot.float svg,#indi-bot.hop svg{animation:none}#indi-bubble{animation-duration:1ms}}`;
++  D.head.appendChild(css);
++
++  const root = D.createElement('div'); root.id = 'indi-root'; root.setAttribute('aria-live', 'polite');
++  root.innerHTML = `<button id="indi-bot" class="is-hidden" type="button" aria-label="Indi assistant. Press Enter to open suggestions." tabindex="-1">
++    <span id="indi-shadow"></span>${robot()}</button>`;
++  D.body.appendChild(root);
++  const bot = root.querySelector('#indi-bot');
++
++  function robot() {
++    return `<svg viewBox="0 0 56 60" width="56" height="60" aria-hidden="true" style="overflow:visible">
++      <defs><radialGradient id="ib" cx="35%" cy="28%" r="80%"><stop offset="0%" stop-color="#fff"/><stop offset="55%" stop-color="${C.SOFT}"/><stop offset="100%" stop-color="#BDB2F5"/></radialGradient></defs>
++      <line x1="28" y1="9" x2="28" y2="3.5" stroke="${C.VIOLET}" stroke-width="1.6" stroke-linecap="round"/>
++      <circle id="ia" cx="28" cy="3" r="2.2" fill="${C.CYAN}"/>
++      <ellipse cx="7" cy="36" rx="3.2" ry="5" fill="url(#ib)" stroke="${C.LAVENDER}" stroke-width=".6"/>
++      <g id="iarm"><ellipse cx="49" cy="36" rx="3.2" ry="5" fill="url(#ib)" stroke="${C.LAVENDER}" stroke-width=".6"/></g>
++      <g id="imag" style="display:none"><circle cx="49" cy="26" r="4" fill="none" stroke="${C.CYAN}" stroke-width="1.6"/><line x1="46.5" y1="29" x2="44" y2="32.5" stroke="${C.VIOLET}" stroke-width="1.8" stroke-linecap="round"/></g>
++      <ellipse cx="28" cy="46" rx="13" ry="9" fill="url(#ib)" stroke="${C.LAVENDER}" stroke-width=".6"/>
++      <circle cx="28" cy="46" r="2.6" fill="${C.ORCHID}"/><circle cx="28" cy="46" r="1" fill="${C.GOLD}"/>
++      <rect x="9" y="9" width="38" height="30" rx="15" fill="url(#ib)" stroke="${C.LAVENDER}" stroke-width=".6"/>
++      <rect x="9" y="22" width="3" height="7" rx="1.5" fill="${C.VIOLET}"/><rect x="44" y="22" width="3" height="7" rx="1.5" fill="${C.VIOLET}"/>
++      <rect x="14" y="15" width="28" height="18" rx="9" fill="${C.INDIGO}"/>
++      <g id="ieyes"><ellipse id="iel" cx="21.5" cy="24" rx="3.2" ry="3.6" fill="${C.SAPPHIRE}"/><ellipse id="ier" cx="34.5" cy="24" rx="3.2" ry="3.6" fill="${C.SAPPHIRE}"/>
++        <circle cx="22.6" cy="22.6" r="1" fill="#A5F3FC"/><circle cx="35.6" cy="22.6" r="1" fill="#A5F3FC"/></g>
++      <circle cx="16.5" cy="30.5" r="1.6" fill="${C.ORCHID}" opacity=".55"/><circle cx="39.5" cy="30.5" r="1.6" fill="${C.ORCHID}" opacity=".55"/>
++      <path id="imouth" d="M25.5 29.3 q2.5 1.8 5 0" stroke="${C.CYAN}" stroke-width="1" fill="none" stroke-linecap="round"/>
++    </svg>`;
++  }
++
++  // ---- mood -------------------------------------------------------------------------
++  function mood(m) {
++    const a = root.querySelector('#ia'), arm = root.querySelector('#iarm'), mag = root.querySelector('#imag'),
++          l = root.querySelector('#iel'), r = root.querySelector('#ier'), mouth = root.querySelector('#imouth');
++    a.setAttribute('fill', quiet ? C.DIM : {investigate: C.AMBER, concerned: C.CORAL_ROSE, happy: C.EMERALD}[m] || C.CYAN);
++    mag.style.display = m === 'investigate' ? '' : 'none';
++    arm.setAttribute('transform', m === 'point' ? 'rotate(-70 49 36)' : '');
++    const ry = quiet ? 1 : m === 'investigate' ? 1.6 : 3.6;
++    l.setAttribute('ry', m === 'investigate' ? 1.6 : ry); r.setAttribute('ry', ry);
++    mouth.setAttribute('d', m === 'concerned' ? 'M25.5 30.5 q2.5 -1.6 5 0' : 'M25.5 29.3 q2.5 1.8 5 0');
++    bot.classList.toggle('hop', m === 'happy');
++  }
++
++  // ---- geometry ---------------------------------------------------------------------
++  function canvas() {
++    const m = D.querySelector('[data-testid="stMain"]') || D.querySelector('section.main') || D.body;
++    return m.getBoundingClientRect();
++  }
++  function clamp(p) {
++    const m = canvas(), h = 36;
++    return {x: Math.min(Math.max(p.x, m.left + h), Math.min(m.right, P.innerWidth) - h),
++            y: Math.min(Math.max(p.y, Math.max(m.top, 0) + 70), Math.min(m.bottom, P.innerHeight) - h)};
++  }
++  function anchorFor(el) {
++    const r = el.getBoundingClientRect();
++    if (r.top - 34 > 80) return clamp({x: r.right - 26, y: r.top - 24});  // peek over the card's top edge
++    return clamp({x: r.right + 40 < P.innerWidth ? r.right + 32 : r.left - 32, y: r.top + 36});
++  }
++  function logo() {
++    const b = D.querySelector('.brand-mark');
++    const r = b && b.getBoundingClientRect();
++    return r && r.width ? {x: r.left + r.width / 2, y: r.top + r.height / 2} : {x: 40, y: 40};
++  }
++  function place(p) { pos = p; bot.style.transform = `translate(${p.x - 28}px, ${p.y - 30}px)`; positionBubble(); }
++  const ease = t => t < .5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
++  function travel(to, opt = {}) {
++    if (!opt.free) to = clamp(to);
++    P.cancelAnimationFrame(anim);
++    const from = pos, dist = Math.hypot(to.x - from.x, to.y - from.y);
++    if (reduced() || dist < 2) { place(to); opt.done && opt.done(); return; }
++    const dur = opt.dur || Math.min(650, Math.max(350, 350 + dist * .35));
++    const c = opt.swoop ? {x: to.x + (from.x - to.x) * .25, y: to.y + (from.y - to.y) * .85}
++                        : {x: (from.x + to.x) / 2, y: Math.min(from.y, to.y) - Math.min(90, dist * .25)};
++    const t0 = P.performance.now();
++    const step = now => {
++      const t = ease(Math.min(1, (now - t0) / dur)), u = 1 - t;
++      place({x: u*u*from.x + 2*u*t*c.x + t*t*to.x, y: u*u*from.y + 2*u*t*c.y + t*t*to.y});
++      if (t < 1) anim = P.requestAnimationFrame(step); else opt.done && opt.done();
++    };
++    anim = P.requestAnimationFrame(step);
++  }
++  function goTo(el, force) {
++    if (hidden || ((quiet || reduced()) && !force)) return;
++    target = el; lastMove = Date.now();
++    if (!quiet) travel(el ? anchorFor(el) : clamp({x: canvas().right - 70, y: P.innerHeight - 90}));
++  }
++
++  // ---- bubble -----------------------------------------------------------------------
++  let bubble = null;
++  function say(msg, chips = [], m = 'curious') {
++    if (hidden) return;
++    close(false);
++    mood(m);
++    bubble = D.createElement('div'); bubble.id = 'indi-bubble'; bubble.setAttribute('role', 'dialog'); bubble.setAttribute('aria-label', 'Indi suggestion');
++    bubble.innerHTML = `<span id="indi-tail"></span><div class="hd"><span class="nm">INDI</span><button class="x" aria-label="Dismiss">×</button></div>
++      <div class="msg"></div><div class="chips"></div>
++      <div class="ft"><span>Quotes on-screen values only</span><button class="q">${quiet ? 'Resume roaming' : 'Quiet mode'}</button></div>`;
++    bubble.querySelector('.msg').textContent = msg;
++    const box = bubble.querySelector('.chips');
++    chips.forEach(([label, run]) => { const b = D.createElement('button'); b.className = 'chip'; b.textContent = label; b.onclick = run; box.appendChild(b); });
++    if (!chips.length) box.remove();
++    bubble.querySelector('.x').onclick = () => close();
++    bubble.querySelector('.q').onclick = toggleQuiet;
++    root.appendChild(bubble); bubbleOpen = true; positionBubble();
++  }
++  function close(rest = true) { if (bubble) bubble.remove(); bubble = null; bubbleOpen = false; if (rest) mood('idle'); }
++  function positionBubble() {
++    if (!bubble) return;
++    const W = 270, h = bubble.offsetHeight || 140, m = canvas(), left = pos.x - 42 - W > Math.max(m.left, 0) + 8;
++    const x = left ? pos.x - 42 - W : pos.x + 42;
++    const y = Math.min(Math.max(pos.y - 40, 8), P.innerHeight - h - 8);
++    bubble.style.transform = `translate(${x}px, ${y}px)`;
++    const tail = bubble.querySelector('#indi-tail');
++    tail.style.top = Math.min(Math.max(pos.y - y - 6, 14), h - 20) + 'px';
++    tail.style.left = left ? (W - 6) + 'px' : '-6px';
++    tail.style.borderRight = left ? '1px solid rgba(169,155,255,.35)' : ''; tail.style.borderTop = left ? '1px solid rgba(169,155,255,.35)' : '';
++    tail.style.borderLeft = left ? '' : '1px solid rgba(169,155,255,.35)'; tail.style.borderBottom = left ? '' : '1px solid rgba(169,155,255,.35)';
++  }
++  function toggleQuiet() {
++    quiet = !quiet; store.setItem('indi-quiet', quiet ? '1' : '0');
++    bot.classList.toggle('float', !quiet && !reduced());
++    say(quiet ? 'Quiet mode on. I will stay here until you need me.' : "I'm back and will follow what you explore.", [], 'idle');
++    setTimeout(() => close(), 2200);
++  }
++  const clickNav = label => { const b = D.querySelector(`.st-key-nav_${label.replace(/[^A-Za-z0-9_-]/g, '-')} button`); b && b.click(); close(); };
++  const text = (el, sel) => ((el.querySelector(sel) || {}).textContent || '').trim();
++
++  // ---- summon / hide from the brand mark --------------------------------------------
++  function summon() {
++    hidden = false; bot.classList.remove('is-hidden'); bot.tabIndex = 0;
++    bot.classList.toggle('float', !quiet && !reduced());
++    place(logo()); lastMove = Date.now();
++    P.requestAnimationFrame(() => travel({x: canvas().left + 120, y: 230}));
++    mood('curious');
++    setTimeout(() => say("Hi, I'm Indi. I'll point things out as you explore. Everything I mention comes from what's on screen.",
++      [['Open action queue', () => clickNav('Recommendations')], ['Back to the logo', retire]]), 700);
++  }
++  function retire() {
++    close(); hidden = true; target = null; bot.tabIndex = -1;
++    travel(logo(), {free: true, swoop: true, dur: 760, done: () => bot.classList.add('is-hidden')});
++    setTimeout(() => bot.classList.add('is-hidden'), 140);
++  }
++  D.addEventListener('click', e => {
++    if (e.target.closest && e.target.closest('.brand-mark')) { hidden ? summon() : retire(); }
++  });
++
++  // ---- real interface events --------------------------------------------------------
++  let hoverT = 0;
++  D.addEventListener('pointerover', e => {
++    const el = e.target.closest && e.target.closest('.kpi, .executive-kpi');
++    P.clearTimeout(hoverT);
++    if (!el || hidden || quiet || el === target) return;
++    hoverT = P.setTimeout(() => {
++      if (Date.now() - lastMove < 2500) return;
++      const label = text(el, '.kpi-label'), value = text(el, '.kpi-value');
++      const note = text(el, '.kpi-detail') || text(el, '.kpi-change');
++      const src = text(el, '.evidence-badge') || text(el, '.kpi-source');
++      goTo(el);
++      say(`${label} shows ${value}${src ? ` (${src})` : ''}. Want to look at its trend?`,
++        [['Explain the label', () => say(note ? `${label}: ${note}` : `${label} has no further detail on this card.`, [], 'idle')],
++         ['Open Domain Intelligence', () => clickNav('Domain Intelligence')]]);
++    }, 900);
++  });
++  D.addEventListener('click', e => {
++    if (hidden || !e.target.closest || e.target.closest('#indi-root')) return;
++    const chart = e.target.closest('[data-testid="stPlotlyChart"]');
++    const action = e.target.closest('.summary-action');
++    if (chart) {
++      goTo(chart, true);
++      say('Want to explore this chart? Hover a point for its dated source and classification. Forecast ranges are empirical error envelopes, not guarantees.',
++        [['Forecasts & Anomalies', () => clickNav('Forecasts & Anomalies')], ['Data & Methodology', () => clickNav('Data & Methodology')]], 'point');
++    } else if (action) {
++      goTo(action, true);
++      const strong = text(action, 'strong');
++      const high = /high|critical|1\b/i.test(strong);
++      say(`This review item is "${strong}". It is a statistical screening result to verify, not a confirmed fault.`,
++        [['Open action queue', () => clickNav('Recommendations')]], high ? 'concerned' : 'investigate');
++    }
++  }, true);
++
++  // Successful saves / resets surface as Streamlit toasts or success alerts.
++  new P.MutationObserver(muts => {
++    if (hidden) return;
++    for (const m of muts) for (const n of m.addedNodes) {
++      if (n.nodeType === 1 && (n.matches?.('[data-testid="stToast"], [data-testid="stAlertContentSuccess"]') || n.querySelector?.('[data-testid="stAlertContentSuccess"]'))) {
++        say('Done. That change went through.', [], 'happy'); setTimeout(() => close(), 2200); return;
++      }
++    }
++  }).observe(D.body, {childList: true, subtree: true});
++
++  // Page changes: move toward the first chart or KPI row of the new page.
++  let lastHeading = '';
++  P.setInterval(() => {
++    if (hidden) return;
++    const h = text(D, '.page-intro h1');
++    if (h && h !== lastHeading) {
++      const first = !lastHeading; lastHeading = h;
++      if (!first && !bubbleOpen) P.setTimeout(() => goTo(D.querySelector('[data-testid="stPlotlyChart"], .executive-kpi, .kpi')), 600);
++    }
++    if (target && !target.isConnected) target = null;
++  }, 800);
++
++  // Follow the target while scrolling; keep within the canvas on resize.
++  const sync = () => { if (hidden) return; if (target && target.isConnected) {
++      const r = target.getBoundingClientRect();
++      if (r.bottom < 60 || r.top > P.innerHeight - 40) { target = null; } else if (!quiet) place(anchorFor(target));
++    } else place(clamp(pos)); };
++  D.addEventListener('scroll', () => P.requestAnimationFrame(sync), {capture: true, passive: true});
++  P.addEventListener('resize', sync);
++
++  // Infrequent, purposeful patrol between visible KPIs and charts.
++  P.setInterval(() => {
++    if (hidden || quiet || reduced() || bubbleOpen || D.hidden || Date.now() - lastMove < 9000) return;
++    const pool = [...D.querySelectorAll('.executive-kpi, .kpi, [data-testid="stPlotlyChart"]')].filter(el => {
++      const r = el.getBoundingClientRect(); return el !== target && r.width && r.top > 90 && r.bottom < P.innerHeight - 20; });
++    const el = pool[Math.floor(Math.random() * pool.length)];
++    if (el) { goTo(el); P.setTimeout(() => mood(el.matches('[data-testid="stPlotlyChart"]') ? 'point' : 'curious'), 450); P.setTimeout(() => bubbleOpen || mood('idle'), 2600); }
++  }, 12000);
++
++  // Eye tracking and proximity tilt.
++  D.addEventListener('pointermove', e => {
++    if (hidden) return;
++    const dx = e.clientX - pos.x, dy = e.clientY - pos.y, d = Math.hypot(dx, dy) || 1, k = Math.min(1, d / 160);
++    root.querySelector('#ieyes').setAttribute('transform', `translate(${(dx / d * 2.4 * k).toFixed(2)} ${(dy / d * 1.8 * k).toFixed(2)})`);
++    bot.style.setProperty('--tilt', d < 120 ? `${(dx / d * 6).toFixed(1)}deg` : '0deg');
++  }, {passive: true});
++
++  // Direct interaction: click or keyboard opens suggestions; arrows nudge; Escape closes.
++  bot.addEventListener('click', () => bubbleOpen ? close() :
++    say(`You're on ${text(D, '.page-intro h1') || 'Nexora'}. How can I help?`,
++      [['Open action queue', () => clickNav('Recommendations')], [quiet ? 'Resume roaming' : 'Quiet mode', toggleQuiet], ['Back to the logo', retire]]));
++  bot.addEventListener('keydown', e => {
++    const s = e.shiftKey ? 48 : 16, v = {ArrowLeft: [-s, 0], ArrowRight: [s, 0], ArrowUp: [0, -s], ArrowDown: [0, s]}[e.key];
++    if (v) { e.preventDefault(); target = null; place(clamp({x: pos.x + v[0], y: pos.y + v[1]})); }
++  });
++  D.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
++  mood('idle');
++})();
++</script>
++"""
++
++
++def render_indi():
++    """Mount Indi once per browser session. Safe to call on every rerun."""
++    tokens = {name: getattr(theme, name) for name in [
++        'INDIGO', 'MIDNIGHT', 'SAPPHIRE', 'VIOLET', 'ORCHID', 'LAVENDER', 'CYAN', 'GOLD',
++        'TEXT', 'SOFT', 'MUTED', 'DIM', 'EMERALD', 'AMBER', 'CORAL_ROSE']}
++    tokens['ORCHID_SOFT'] = '#D08FD2'
++    with st.container(key='indi_layer'):
++        # Trusted, first-party markup only; the iframe is same-origin so the overlay can mount in the page.
++        st.iframe('<!doctype html><html><body>' + _SCRIPT.replace('__TOKENS__', json.dumps(tokens)) + '</body></html>', height=1)
+diff --git a/dashboard/intelligence.py b/dashboard/intelligence.py
+index 70c4a03..0a521a0 100644
+--- a/dashboard/intelligence.py
++++ b/dashboard/intelligence.py
+@@ -4,6 +4,7 @@ import hashlib
+ import numpy as np
+ import pandas as pd
+ import plotly.graph_objects as go
++from dashboard import theme
+ import streamlit as st
+ 
+ from dashboard.monthly_analytics import fmt, series_chart, chart_layout
+@@ -148,14 +149,14 @@ def render_scenarios(data, selection, domains, metrics):
+                 name='Empirical error-range lower', line=dict(width=0), connectgaps=False, showlegend=False))
+             figure.add_trace(go.Scatter(x=result.upper.index, y=result.upper.values, mode='lines',
+                 name='Empirical error range', fill='tonexty',
+-                fillcolor='rgba(13,148,136,.12)', line=dict(width=0), connectgaps=False))
++                fillcolor=theme.FORECAST_BAND, line=dict(width=0), connectgaps=False))
+         figure.add_trace(go.Scatter(x=result.points.index, y=result.points.values, mode='lines+markers',
+             name='Baseline forecast', line=dict(dash='dash')))
+         if selection != ALL_AREAS:
+             figure.add_trace(go.Scatter(x=[history.date.iloc[-1]], y=[injected], mode='markers',
+-                name='Injected reading · hypothetical', marker=dict(color='#d97706', size=12, symbol='diamond')))
++                name='Injected reading · hypothetical', marker=dict(color=theme.SCENARIO, size=12, symbol='diamond')))
+             figure.add_trace(go.Scatter(x=simulation.index, y=simulation.values, mode='lines+markers',
+-                name='Scenario forecast · simulation', line=dict(color='#d97706')))
++                name='Scenario forecast · simulation', line=dict(color=theme.SCENARIO)))
+         st.plotly_chart(chart_layout(figure), width='stretch', key=f'scenario_forecast_{area}_{key}')
+         table = pd.DataFrame({'area_id': area, 'Forecast month': result.points.index.strftime('%Y-%m'),
+                              'Model': METHOD_NAMES[result.method], 'Baseline projection': result.points.values,
+diff --git a/dashboard/monthly_analytics.py b/dashboard/monthly_analytics.py
+index 4439f08..b52e563 100644
+--- a/dashboard/monthly_analytics.py
++++ b/dashboard/monthly_analytics.py
+@@ -2,6 +2,7 @@
+ import numpy as np
+ import pandas as pd
+ import plotly.graph_objects as go
++from dashboard import theme
+ 
+ 
+ def fmt(num, unit='', short=True):
+@@ -37,7 +38,7 @@ def chart_layout(figure):
+     figure.update_layout(height=340, margin=dict(l=10,r=10,t=35,b=30),
+         paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+         hovermode='x unified', legend=dict(orientation='h'),
+-        xaxis=dict(tickformat='%b %Y'), yaxis=dict(gridcolor='#edf1f5'))
++        xaxis=dict(tickformat='%b %Y'), yaxis=dict(gridcolor=theme.GRID))
+     return figure
+ 
+ 
+diff --git a/dashboard/monthly_ui.py b/dashboard/monthly_ui.py
+index 11e72b3..8c52a7b 100644
+--- a/dashboard/monthly_ui.py
++++ b/dashboard/monthly_ui.py
+@@ -4,12 +4,15 @@ from html import escape
+ import numpy as np
+ import streamlit as st
+ 
++from dashboard import theme
++
+ 
+ ACCENTS = {
+-    "electricity_kwh": "#4338CA", "water_consumption_l": "#0284c7",
+-    "pm25_ug_m3": "#a16207", "vehicle_count": "#4338CA",
+-    "building_occupancy_pct": "#4338CA", "waste_kg": "#15803D",
+-    "co2e_kg": "#475569", "flood_risk_pct": "#2563eb",
++    # Domain accents from the Royal Indigo system; surfaces stay shared.
++    "electricity_kwh": theme.CYAN, "water_consumption_l": theme.TEAL_SOFT,
++    "pm25_ug_m3": theme.EMERALD, "vehicle_count": theme.SAPPHIRE_SOFT,
++    "building_occupancy_pct": theme.GOLD, "waste_kg": theme.EMERALD,
++    "co2e_kg": theme.TEAL_CYAN, "flood_risk_pct": theme.LAVENDER,
+ }
+ SYMBOLS = {"electricity_kwh": "ϟ", "water_consumption_l": "◉", "pm25_ug_m3": "≋",
+            "vehicle_count": "↗", "building_occupancy_pct": "▥", "waste_kg": "♲",
+@@ -23,6 +26,7 @@ PROVENANCE = {"electricity_kwh": "Simulated", "water_consumption_l": "Modelled",
+ def inject_theme():
+     from pathlib import Path
+     css = Path(__file__).with_name('style.css').read_text(encoding='utf8')
++    theme.register_plotly_template()
+     st.markdown('<style>' + css + '</style>', unsafe_allow_html=True)
+ 
+ 
+@@ -36,7 +40,7 @@ def metric_card(key, name, value, unit, series, change=None, source_label=None):
+     """Compact KPI with neutral change semantics and an accessible trend preview."""
+     values = np.asarray(series.tail(12), dtype=float)
+     values = values[np.isfinite(values)]
+-    color = ACCENTS.get(key, "#4338CA")
++    color = ACCENTS.get(key, theme.LAVENDER)
+     spark = ""
+     if len(values) > 1:
+         spread = float(np.ptp(values))
+diff --git a/dashboard/style.css b/dashboard/style.css
+index 90e15de..b94a917 100644
+--- a/dashboard/style.css
++++ b/dashboard/style.css
+@@ -1,59 +1,113 @@
+-:root{color-scheme:light;--ink:#172033;--muted:#64748B;--line:#E2E8F0;--accent:#4338CA;--positive:#15803D;--attention:#D97706;--high-risk:#B91C1C}
++/* Nexora · Royal Indigo design system. Presentation only; selectors mirror the Streamlit layout keys. */
++:root{color-scheme:dark;
++  --indigo:#17143B;--midnight:#1D3159;--plum:#32153C;--slate:#252249;--raised:#2E2A5A;--line:#3B3677;--divider:rgba(232,227,250,.09);
++  --sapphire:#315CE8;--sapphire-soft:#6A8CF0;--violet:#7767D9;--orchid:#B65CB9;--lavender:#A99BFF;
++  --teal-blue:#4E7F95;--teal-soft:#7FB0C5;--cyan:#42D9F5;--gold:#E6C477;
++  --white:#FFFFFF;--text:#F3F0FF;--soft:#E8E3FA;--muted:#B8B2D2;--dim:#918BAF;--disabled:#6E6890;
++  --positive:#43D6A0;--attention:#F5B84B;--high-risk:#FF6B7A;--coral:#FF9A76;
++  --ink:var(--text);--accent:var(--sapphire);
++  --radius:14px;--shadow:0 1px 0 rgba(255,255,255,.04) inset,0 14px 30px -20px rgba(6,4,30,.9);--shadow-hover:0 1px 0 rgba(255,255,255,.06) inset,0 22px 40px -22px rgba(24,14,80,.95);
++  --ease:cubic-bezier(.33,1,.68,1)}
+ [data-testid="stMarkdownContainer"]:has(.executive-kpi),[data-testid="stMarkdownContainer"]:has(.kpi),[data-testid="stMarkdownContainer"]:has(.brand),[data-testid="stMarkdownContainer"]:has(.page-intro),[data-testid="stMarkdownContainer"]:has(.status-line),[data-testid="stMarkdownContainer"]:has(.summary-reading),[data-testid="stMarkdownContainer"]:has(.summary-title),[data-testid="stMarkdownContainer"]:has(.summary-action),[data-testid="stMarkdownContainer"]:has(.summary-note){margin-bottom:0!important}
+-html,body,.stApp{font-family:Inter,'Segoe UI',sans-serif;background:#F7F8FA;color:var(--ink)}
+-h1,h2,h3,h4{color:var(--ink);letter-spacing:-.025em;font-weight:650}
+-h1{font-size:1.9rem!important}h2{font-size:1.45rem!important}h3{font-size:1.1rem!important}
+-[data-testid="stHeader"]{background:#F7F8FA}
+-[data-testid="stMainBlockContainer"]{max-width:1660px;padding:3rem 2rem 2rem!important}
+-[data-testid="stSidebar"]{background:#FFFFFF;border-right:1px solid var(--line)}
++
++/* Layer 1 · application environment */
++html,body,.stApp{font-family:Inter,'Segoe UI',sans-serif;color:var(--text)}
++.stApp{background:radial-gradient(900px 520px at 100% -10%,rgba(119,103,217,.10),transparent 60%),radial-gradient(800px 520px at 20% 115%,rgba(50,21,60,.55),transparent 65%),linear-gradient(165deg,var(--indigo) 0%,#1A1A47 60%,#1B2650 120%);background-attachment:fixed}
++h1,h2,h3,h4{color:var(--white);letter-spacing:-.02em;font-weight:650}
++h1{font-size:1.75rem!important}h2{font-size:1.35rem!important}h3{font-size:1.05rem!important}
++p,li,label,[data-testid="stMarkdownContainer"]{color:var(--soft)}
++strong{color:var(--white)}
++a{color:var(--lavender)}a:hover{color:var(--white)}
++[data-testid="stHeader"]{background:transparent}
++[data-testid="stMainBlockContainer"]{max-width:1660px;padding:2.4rem 2rem 2rem!important}
++::selection{background:rgba(119,103,217,.45)}
++
++/* Layer 2 · navigation and structure */
++[data-testid="stSidebar"]{background:linear-gradient(180deg,#1B1846,var(--indigo));border-right:1px solid var(--divider)}
+ [data-testid="stSidebar"][aria-expanded="true"]{min-width:238px;max-width:260px}
+ [data-testid="stSidebar"] [data-testid="stSidebarContent"]{padding:1.25rem .85rem}
+ [data-testid="stSidebarCollapseButton"]{visibility:visible!important}
+ [data-testid="stSidebarCollapseButton"] button{width:auto;gap:6px;padding:4px 8px}
+-[data-testid="stSidebarCollapseButton"] button::after{content:"Collapse";font-size:12px;color:#475569}
++[data-testid="stSidebarCollapseButton"] button::after{content:"Collapse";font-size:12px;color:var(--muted)}
+ [data-testid="stSidebar"] button{justify-content:flex-start;text-align:left}
+-[data-testid="stSidebar"] .stButton button{border-color:transparent;background:transparent;box-shadow:none;padding:.65rem .85rem}
+-[data-testid="stSidebar"] .stButton button[kind="primary"]{background:#EEF2FF;color:#3730A3;border:1px solid #C7D2FE}
++[data-testid="stSidebar"] .stButton button{border:1px solid transparent;background:transparent;box-shadow:none;padding:.6rem .8rem;color:var(--muted);min-height:38px}
++[data-testid="stSidebar"] .stButton button:hover{background:rgba(232,227,250,.05);border-color:var(--divider);color:var(--white)}
++[data-testid="stSidebar"] .stButton button[kind="primary"]{background:linear-gradient(90deg,rgba(49,92,232,.28),rgba(119,103,217,.14));color:var(--white);border:1px solid rgba(106,140,240,.45);box-shadow:inset 3px 0 0 var(--sapphire)}
++[data-testid="stSidebar"] hr{border-color:var(--divider)}
+ .brand{display:flex;align-items:center;gap:10px;margin:0 0 1.5rem}
+-.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:var(--accent);color:white;font-size:24px}
+-.brand-name{font-size:22px;font-weight:750;letter-spacing:-.8px}.brand-sub{font-size:12px;color:var(--muted);margin-top:2px}
+-.nav-label{font-size:12px;color:var(--muted);font-weight:600;margin:0 0 10px}
+-.sidebar-note{border:1px solid var(--line);border-radius:10px;padding:13px;background:#F7F8FA;font-size:13px;line-height:1.6;color:#475569}
+-.st-key-global_header{border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:14px}
+-.header-title{font-size:24px;font-weight:750;letter-spacing:-.7px;margin-bottom:2px}.header-subtitle{font-size:14px;color:var(--muted)}
+-.status-line{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:13px;color:#475569;margin:4px 0 16px}
+-.status-pill,.evidence-badge{display:inline-block;padding:4px 8px;border-radius:5px;border:1px solid #CBD5E1;background:#F8FAFC;font-size:12px;line-height:1.45;color:#475569}
+-.status-pill{border-color:#C7D2FE;background:#EEF2FF;color:#3730A3}
+-.page-intro{margin:5px 0 20px}.page-intro h1{margin:0 0 6px;padding:0}.page-intro p{font-size:14px;color:var(--muted);line-height:1.65;margin:0}
+-.st-key-executive_kpis [data-testid="stHorizontalBlock"],.st-key-domain_cards [data-testid="stHorizontalBlock"]{gap:16px!important}
+-.executive-kpi,.kpi{background:#FFFFFF;border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 2px 8px #17203304;min-height:182px}
+-.executive-kpi .kpi-label{min-height:40px}.executive-kpi .kpi-detail{min-height:40px}
+-.kpi-label{font-size:14px;color:#475569;font-weight:550;line-height:1.4}
+-.kpi-value{font-size:28px;font-weight:700;color:var(--ink);line-height:1.3;margin:9px 0 5px;letter-spacing:-.6px}
+-.kpi-unit{font-size:13px;color:var(--muted);font-weight:500;margin-left:5px;letter-spacing:0}
+-.kpi-detail{font-size:12px;color:#475569;line-height:1.6}.kpi-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+-.kpi-icon{color:var(--card-accent);font-size:21px}.kpi-footer{display:flex;gap:6px;flex-wrap:wrap;font-size:12px;color:#475569;margin-top:9px;line-height:1.5}
+-.kpi-spark{display:block;width:100%;height:28px;margin-top:12px}.kpi-source{font-size:12px;color:#475569;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:4px;padding:3px 6px}
+-[data-testid="stMetric"]{background:#FFFFFF;border:1px solid var(--line);border-radius:10px;padding:16px}
+-[data-testid="stMetricValue"]{font-size:27px;color:var(--ink)}
++.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,var(--sapphire),var(--violet));color:var(--white);font-size:22px;box-shadow:0 6px 16px -8px rgba(49,92,232,.8)}
++.brand-name{font-size:21px;font-weight:750;letter-spacing:-.6px;color:var(--white)}.brand-sub{font-size:12px;color:var(--muted);margin-top:2px}
++.nav-label{font-size:11px;color:var(--dim);font-weight:600;letter-spacing:.1em;margin:0 0 10px}
++.sidebar-note{border:1px solid var(--divider);border-left:3px solid var(--orchid);border-radius:10px;padding:13px;background:rgba(50,21,60,.45);font-size:13px;line-height:1.6;color:var(--muted)}
++.sidebar-note strong{color:var(--white)}
++.st-key-global_header{border-bottom:1px solid var(--divider);padding-bottom:14px;margin-bottom:14px}
++.header-title{font-size:22px;font-weight:750;letter-spacing:-.5px;margin-bottom:2px;color:var(--white)}.header-subtitle{font-size:13px;color:var(--muted)}
++.status-line{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:12.5px;color:var(--muted);margin:4px 0 14px}
++.status-line strong{color:var(--white)}
++.status-pill,.evidence-badge{display:inline-block;padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:rgba(232,227,250,.04);font-size:11.5px;line-height:1.45;color:var(--muted)}
++.status-pill{border-color:rgba(67,214,160,.4);background:rgba(67,214,160,.10);color:var(--positive)}
++
++/* Layer 3 · operational content */
++.page-intro{margin:4px 0 18px}.page-intro h1{margin:0 0 4px;padding:0}.page-intro p{font-size:13.5px;color:var(--muted);line-height:1.6;margin:0;max-width:820px}
++.st-key-executive_kpis [data-testid="stHorizontalBlock"],.st-key-domain_cards [data-testid="stHorizontalBlock"]{gap:14px!important}
++.executive-kpi,.kpi{position:relative;overflow:hidden;background:var(--slate);border:1px solid rgba(169,155,255,.16);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);min-height:168px;
++  transition:transform 220ms var(--ease),border-color 200ms ease,box-shadow 220ms ease}
++.executive-kpi:hover,.kpi:hover{transform:translateY(-3px);border-color:rgba(169,155,255,.34);box-shadow:var(--shadow-hover)}
++.kpi::before{content:"";position:absolute;inset:0 0 auto;height:2px;background:linear-gradient(90deg,var(--card-accent,var(--lavender)),transparent 75%);opacity:.85}
++.executive-kpi::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--sapphire);opacity:.8}
++.executive-kpi::after,.kpi::after{content:"";position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity 260ms ease;background:radial-gradient(220px circle at var(--mx,50%) var(--my,0%),rgba(169,155,255,.12),rgba(49,92,232,.05) 45%,transparent 70%)}
++.executive-kpi:hover::after,.kpi:hover::after{opacity:1}
++.executive-kpi .kpi-label{min-height:38px}.executive-kpi .kpi-detail{min-height:38px}
++.kpi-label{font-size:13px;color:var(--muted);font-weight:550;line-height:1.4}
++.kpi-value{font-size:28px;font-weight:700;color:var(--white);line-height:1.25;margin:8px 0 5px;letter-spacing:-.6px;font-variant-numeric:tabular-nums}
++.kpi-unit{font-size:12.5px;color:var(--muted);font-weight:500;margin-left:5px;letter-spacing:0}
++.kpi-detail{font-size:12px;color:var(--muted);line-height:1.55}.kpi-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
++.kpi-icon{color:var(--card-accent);font-size:20px}.kpi-footer{display:flex;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:9px;line-height:1.5}
++.kpi-change{color:var(--soft)}
++.kpi-spark{display:block;width:100%;height:28px;margin-top:12px}.kpi-source{font-size:11px;color:var(--muted);background:rgba(232,227,250,.04);border:1px solid var(--line);border-radius:5px;padding:2px 6px}
++[data-testid="stMetric"]{background:var(--slate);border:1px solid rgba(169,155,255,.16);border-radius:12px;padding:14px 16px}
++[data-testid="stMetricLabel"] p{color:var(--muted)!important}
++[data-testid="stMetricValue"]{font-size:26px;color:var(--white);font-variant-numeric:tabular-nums}
+ [data-testid="stCaptionContainer"]{opacity:1!important}
+-[data-testid="stCaptionContainer"] p{font-size:13px;color:#64748B;line-height:1.65}
+-[data-testid="stVerticalBlockBorderWrapper"]>div{background:#FFFFFF;border-color:var(--line)!important;border-radius:12px!important}
+-.st-key-command_map,.st-key-command_summary,.st-key-geographic_map,.st-key-forecast_results,.st-key-scenario_page,.st-key-recommendations_page{background:#FFFFFF;border:1px solid var(--line);border-radius:12px;padding:18px}
++[data-testid="stCaptionContainer"] p{font-size:12.5px;color:var(--muted);line-height:1.6}
++[data-testid="stVerticalBlockBorderWrapper"]>div{background:var(--slate);border-color:rgba(169,155,255,.16)!important;border-radius:var(--radius)!important}
++.st-key-command_map,.st-key-command_summary,.st-key-geographic_map,.st-key-forecast_results,.st-key-scenario_page,.st-key-recommendations_page{background:var(--slate);border:1px solid rgba(169,155,255,.16);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
++/* Analytical panels lean blue, the AI action queue leans plum */
++.st-key-command_map,.st-key-geographic_map,.st-key-forecast_results{background:linear-gradient(170deg,#21305C 0%,var(--slate) 55%)}
++.st-key-recommendations_page,.st-key-scenario_page{background:linear-gradient(170deg,#2D1C4A 0%,var(--slate) 60%);border-color:rgba(182,92,185,.3)}
++.st-key-recommendations_page{box-shadow:inset 0 2px 0 var(--orchid),var(--shadow)}
+ .st-key-command_summary{gap:10px!important}
+-.panel-heading{font-size:15px;font-weight:650;display:flex;justify-content:space-between;gap:10px;line-height:1.5}.panel-heading span{font-size:13px;font-weight:400;color:var(--muted)}
+-.panel-caption{font-size:13px;color:var(--muted);line-height:1.6;margin:6px 0 14px}
+-.summary-title{font-size:12px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:#64748B;margin:13px 0 6px}
+-.summary-reading{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid #F1F5F9;font-size:14px;color:#475569}.summary-reading strong{color:#172033;white-space:nowrap}
+-.summary-note{font-size:13px;line-height:1.65;color:#475569;margin-top:8px}.summary-action{border-left:3px solid #4338CA;background:#F8FAFC;padding:11px 12px;border-radius:5px;font-size:13px;line-height:1.6}
+-.stButton button,.stDownloadButton button{border:1px solid #CBD5E1;border-radius:8px;background:#FFFFFF;color:#334155;min-height:42px;font-size:14px}
+-.stButton button:hover,.stDownloadButton button:hover{border-color:var(--accent);color:var(--accent);background:#EEF2FF}
+-.stButton button[kind="primary"]{background:var(--accent);color:white;border-color:var(--accent)}
+-button:focus-visible,input:focus-visible,[role="combobox"]:focus-visible{outline:2px solid var(--accent)!important;outline-offset:3px}
+-[data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:8px;overflow:hidden}
+-.water-scope-note{background:#FFFBEB;border:1px solid #FDE68A;border-radius:8px;padding:14px;color:#92400E;font-size:14px;line-height:1.6;margin:12px 0}
+-.footer{border-top:1px solid var(--line);padding-top:16px;margin-top:26px;color:var(--muted);font-size:12px;line-height:1.6}
++.panel-heading{font-size:15px;font-weight:650;color:var(--white);display:flex;justify-content:space-between;gap:10px;line-height:1.5}.panel-heading span{font-size:12.5px;font-weight:400;color:var(--muted)}
++.panel-caption{font-size:12.5px;color:var(--muted);line-height:1.6;margin:6px 0 14px}
++.summary-title{font-size:11px;font-weight:650;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:14px 0 6px}
++.summary-reading{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--divider);font-size:13.5px;color:var(--muted)}.summary-reading strong{color:var(--white);white-space:nowrap;font-variant-numeric:tabular-nums}
++.summary-note{font-size:13px;line-height:1.6;color:var(--muted);margin-top:8px}
++.summary-action{border-left:3px solid var(--orchid);background:rgba(50,21,60,.55);padding:11px 12px;border-radius:6px;font-size:13px;line-height:1.6;color:var(--soft)}
++
++/* Layer 4 · interactive highlights */
++.stButton button,.stDownloadButton button,.stLinkButton a{border:1px solid var(--line);border-radius:9px;background:rgba(232,227,250,.04);color:var(--soft);min-height:40px;font-size:13.5px;transition:background-color 200ms ease,border-color 200ms ease,color 200ms ease}
++.stButton button:hover,.stDownloadButton button:hover,.stLinkButton a:hover{border-color:var(--sapphire-soft);color:var(--white);background:rgba(49,92,232,.16)}
++.stButton button[kind="primary"]{background:var(--sapphire);color:var(--white);border-color:var(--sapphire)}
++.stButton button[kind="primary"]:hover{background:#3D68F0;border-color:#3D68F0}
++.stButton button:disabled,.stDownloadButton button:disabled{color:var(--disabled);border-color:var(--divider);background:transparent}
++button:focus-visible,input:focus-visible,a:focus-visible,[role="combobox"]:focus-visible{outline:2px solid var(--cyan)!important;outline-offset:3px}
++[data-baseweb="select"]>div,[data-baseweb="input"]>div{background:var(--slate)!important;border-color:var(--line)!important}
++[data-baseweb="tag"]{background:rgba(49,92,232,.3)!important;color:var(--white)!important}
++[data-baseweb="popover"] ul{background:var(--slate)!important}
++[data-testid="stSlider"] [role="slider"]{background:var(--white)!important;box-shadow:0 0 0 4px rgba(49,92,232,.35)}
++[data-testid="stExpander"] details{background:var(--slate);border:1px solid rgba(169,155,255,.16)!important;border-radius:12px}
++[data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:10px;overflow:hidden}
++[data-testid="stPlotlyChart"]{border-radius:12px;transition:box-shadow 220ms ease}
++[data-testid="stPlotlyChart"]:hover{box-shadow:0 0 0 1px rgba(106,140,240,.28)}
++[data-testid="stAlert"]{border-radius:10px}
++.water-scope-note{background:rgba(245,184,75,.10);border:1px solid rgba(245,184,75,.35);border-radius:10px;padding:14px;color:#F8D79A;font-size:13.5px;line-height:1.6;margin:12px 0}
++.footer{border-top:1px solid var(--divider);padding-top:16px;margin-top:26px;color:var(--dim);font-size:12px;line-height:1.6}
++
++@media(prefers-reduced-motion:reduce){.executive-kpi,.kpi{transition:none}.executive-kpi:hover,.kpi:hover{transform:none}}
+ @media(max-width:1200px){.st-key-command_layout [data-testid="stHorizontalBlock"]:has(.st-key-command_map){flex-direction:column!important}.st-key-command_layout [data-testid="stHorizontalBlock"]:has(.st-key-command_map)>[data-testid="stColumn"]{width:100%!important;flex:unset!important}}
+ @media(max-width:1050px){.st-key-executive_kpis [data-testid="stHorizontalBlock"],.st-key-domain_cards [data-testid="stHorizontalBlock"]{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))}.st-key-executive_kpis [data-testid="stColumn"],.st-key-domain_cards [data-testid="stColumn"]{width:100%!important;min-width:0!important}.st-key-global_header [data-testid="stHorizontalBlock"]{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px!important}.st-key-global_header [data-testid="stColumn"]{width:100%!important;min-width:0!important}.st-key-global_header [data-testid="stColumn"]:first-child{grid-column:span 2}}
+ @media(max-width:768px){[data-testid="stMainBlockContainer"]{padding:3rem 1rem 1.5rem!important}.st-key-global_header [data-testid="stHorizontalBlock"]{grid-template-columns:minmax(0,1fr)}.st-key-global_header [data-testid="stColumn"]:first-child{grid-column:auto}.st-key-scenario_page [data-testid="stHorizontalBlock"],.st-key-forecast_results [data-testid="stHorizontalBlock"]{flex-direction:column!important}.st-key-scenario_page [data-testid="stColumn"],.st-key-forecast_results [data-testid="stColumn"]{width:100%!important;flex:unset!important;min-width:0!important}.kpi-value{font-size:25px}.st-key-command_map,.st-key-command_summary{padding:12px}.summary-reading{flex-wrap:wrap}}
+ @media(max-width:480px){.st-key-executive_kpis [data-testid="stHorizontalBlock"],.st-key-domain_cards [data-testid="stHorizontalBlock"]{grid-template-columns:minmax(0,1fr)}}
++/* Indi's mount point takes no layout space; the companion floats in its own overlay. */
++.st-key-indi_layer{position:absolute!important;width:0;height:0;overflow:hidden;margin:0!important;padding:0!important}
++[data-testid="stSidebar"] .stButton button>div,[data-testid="stSidebar"] .stButton button [data-testid="stMarkdownContainer"]{justify-content:flex-start;text-align:left;width:100%}
+diff --git a/dashboard/theme.py b/dashboard/theme.py
+new file mode 100644
+index 0000000..ccc5bd1
+--- /dev/null
++++ b/dashboard/theme.py
+@@ -0,0 +1,74 @@
++"""Royal Indigo design tokens shared by CSS, Plotly figures and the Indi companion.
++
++Presentation only: nothing here touches data, models or calculations.
++"""
++import plotly.graph_objects as go
++import plotly.io as pio
++
++# Foundation
++INDIGO = '#17143B'
++MIDNIGHT = '#1D3159'
++PLUM = '#32153C'
++SLATE = '#252249'
++RAISED = '#2E2A5A'
++LINE = '#3B3677'
++# Interaction and AI
++SAPPHIRE = '#315CE8'
++VIOLET = '#7767D9'
++ORCHID = '#B65CB9'
++LAVENDER = '#A99BFF'
++# Analytical accents
++TEAL_BLUE = '#4E7F95'
++TEAL_SOFT = '#7FB0C5'
++TEAL_CYAN = '#5FC7D8'
++SAPPHIRE_SOFT = '#6A8CF0'
++CYAN = '#42D9F5'
++GOLD = '#E6C477'
++# Text
++WHITE = '#FFFFFF'
++TEXT = '#F3F0FF'
++SOFT = '#E8E3FA'
++MUTED = '#B8B2D2'
++DIM = '#918BAF'
++# Status
++EMERALD = '#43D6A0'
++AMBER = '#F5B84B'
++CORAL_ROSE = '#FF6B7A'
++CORAL = '#FF9A76'
++
++#: Per-area series colours: consistent wherever the three localities are compared.
++AREA_COLORWAY = [CYAN, LAVENDER, GOLD]
++#: Selected / unselected map markers.
++MARKER_SELECTED = GOLD
++MARKER_DEFAULT = LAVENDER
++FORECAST = LAVENDER
++FORECAST_BAND = 'rgba(169,155,255,.14)'
++SCENARIO = AMBER
++GRID = 'rgba(232,227,250,.08)'
++
++#: Offline map style: an indigo canvas that needs no network tiles.
++OFFLINE_MAP_STYLE = {'version': 8, 'sources': {}, 'layers': [
++    {'id': 'background', 'type': 'background', 'paint': {'background-color': MIDNIGHT}}]}
++
++
++def map_style(tiles):
++    """Dark street tiles when online tiles are requested, otherwise the offline canvas."""
++    return 'carto-darkmatter' if tiles else OFFLINE_MAP_STYLE
++
++
++HOVER = dict(bgcolor=SLATE, bordercolor=LAVENDER, font=dict(color=TEXT, size=12, family='Inter, Segoe UI, sans-serif'))
++
++
++def register_plotly_template():
++    """Make every figure inherit the Royal Indigo look unless it sets a colour explicitly."""
++    axis = dict(gridcolor=GRID, zerolinecolor=GRID, linecolor=LINE, tickcolor=LINE,
++                tickfont=dict(color=MUTED, size=11), title=dict(font=dict(color=MUTED, size=12)))
++    pio.templates['royal_indigo'] = go.layout.Template(layout=dict(
++        font=dict(family='Inter, Segoe UI, sans-serif', color=SOFT, size=12),
++        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
++        colorway=AREA_COLORWAY + [TEAL_SOFT, ORCHID, EMERALD, CORAL],
++        xaxis=axis, yaxis=axis, hoverlabel=HOVER,
++        legend=dict(font=dict(color=SOFT, size=11), bgcolor='rgba(0,0,0,0)'),
++        title=dict(font=dict(color=WHITE)),
++    ))
++    pio.templates.default = 'plotly_dark+royal_indigo'
+diff --git a/dashboard/water_quality.py b/dashboard/water_quality.py
+index 3ab8288..d55f72b 100644
+--- a/dashboard/water_quality.py
++++ b/dashboard/water_quality.py
+@@ -3,6 +3,7 @@ from html import escape
+ 
+ import pandas as pd
+ import plotly.graph_objects as go
++from dashboard import theme
+ import streamlit as st
+ 
+ from dashboard.environmental_map import map_figure, sample_label
+@@ -21,10 +22,10 @@ def observation_chart(frame):
+                 text=[escape(f"{site} · {r['raw_value']} {r['unit']} · {sample_label(r)}") for _, r in exact.iterrows()],
+                 hovertemplate='%{text}<extra></extra>', showlegend=False))
+     figure.update_layout(height=310, margin=dict(l=15, r=15, t=25, b=40),
+-        paper_bgcolor='white', plot_bgcolor='white', font=dict(color='#344d60'),
++        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color=theme.SOFT),
+         xaxis=dict(title='Sample date / reported monitoring month', type='category'),
+-        yaxis=dict(title=frame.unit.iloc[0] if not frame.empty else '', gridcolor='#edf1f5'),
+-        legend=dict(orientation='h', y=-0.4), hoverlabel=dict(bgcolor='white', font=dict(color='#172b3a')))
++        yaxis=dict(title=frame.unit.iloc[0] if not frame.empty else '', gridcolor=theme.GRID),
++        legend=dict(orientation='h', y=-0.4), hoverlabel=theme.HOVER)
+     return figure
+ 
+ 
+diff --git a/dashboard/workspace.py b/dashboard/workspace.py
+index f1a08ef..95d416b 100644
+--- a/dashboard/workspace.py
++++ b/dashboard/workspace.py
+@@ -3,6 +3,7 @@ from html import escape
+ import hashlib
+ import pandas as pd
+ import plotly.graph_objects as go
++from dashboard import theme
+ import streamlit as st
+ 
+ from facility.area_registry import AREA_IDS
+@@ -96,7 +97,7 @@ def render_map(data, selection, years, detailed=False):
+     figure.update_layout(height=480 if detailed else 390)
+     # Styling only; coordinates, trace identities and provenance hover remain unchanged.
+     for trace in figure.data:
+-        trace.marker.color = '#D97706' if trace.name == data.name(selection) else '#4338CA'
++        trace.marker.color = theme.MARKER_SELECTED if trace.name == data.name(selection) else theme.MARKER_DEFAULT
+     st.plotly_chart(figure, width='stretch', key=f'geography_map_{revision}',
+         on_select='ignore', config={'scrollZoom': True, 'displayModeBar': True})
+     for column, area in zip(st.columns(4), [ALL_AREAS, *AREA_IDS]):
+@@ -260,7 +261,7 @@ def render_domain(root, data, selection, years):
+             b.metric('Selected-period average',fmt(values.mean(),ALL_METRICS[key].unit) if len(values) else '—')
+             c.metric('Available-value range',f'{fmt(values.min())} – {fmt(values.max())}' if len(values) else '—')
+         chart = series_chart(data,view,key)
+-        chart.update_layout(yaxis_title=ALL_METRICS[key].unit,colorway=['#4338CA','#0369A1','#D97706'])
++        chart.update_layout(yaxis_title=ALL_METRICS[key].unit,colorway=theme.AREA_COLORWAY)
+         st.plotly_chart(chart,width='stretch',key='domain_chart_'+key)
+     if domain == 'Air Quality':
+         st.info('Official PM10 and AQI remain separate from legacy PM10. SO₂ below detection limits is not zero. O₃ has a distinct averaging basis.')
+@@ -289,7 +290,7 @@ def render_geography(data, selection, years):
+     key = remembered_selectbox('Comparison indicator',[m.key for m in DOMAINS['Air Quality']],'geography_indicator',lambda k: ALL_METRICS[k].name)
+     # Global selection always controls which area series are drawn.
+     figure = series_chart(data,data.history(selection,years),key)
+-    figure.update_layout(yaxis_title=ALL_METRICS[key].unit,colorway=['#4338CA','#0369A1','#D97706'])
++    figure.update_layout(yaxis_title=ALL_METRICS[key].unit,colorway=theme.AREA_COLORWAY)
+     st.plotly_chart(figure,width='stretch',key='geographic_comparison_'+key)
+     st.dataframe(data.comparison(selection,key,years).drop(columns='area_id'),hide_index=True,width='stretch')
+     ledger = pd.concat([data.provenance(a,k,years) for a in data.areas(selection) for k in ALL_METRICS],ignore_index=True)
+@@ -328,8 +329,8 @@ def render_forecasts(data, selection, years):
+                 st.caption(result.limitations)
+                 if result.lower.notna().any():
+                     figure.add_trace(go.Scatter(x=result.lower.index,y=result.lower,mode='lines',name='Error-range lower',line=dict(width=0),showlegend=False,connectgaps=False))
+-                    figure.add_trace(go.Scatter(x=result.upper.index,y=result.upper,mode='lines',name='Empirical error range',fill='tonexty',fillcolor='rgba(67,56,202,.10)',line=dict(width=0),connectgaps=False))
+-                figure.add_trace(go.Scatter(x=result.points.index,y=result.points,mode='lines+markers',name='Baseline forecast',line=dict(color='#4338CA',dash='dash')))
++                    figure.add_trace(go.Scatter(x=result.upper.index,y=result.upper,mode='lines',name='Empirical error range',fill='tonexty',fillcolor=theme.FORECAST_BAND,line=dict(width=0),connectgaps=False))
++                figure.add_trace(go.Scatter(x=result.points.index,y=result.points,mode='lines+markers',name='Baseline forecast',line=dict(color=theme.FORECAST,dash='dash')))
+                 forecast = pd.DataFrame({'Month': result.points.index,'Baseline projection': result.points.values,'Empirical range lower': result.lower.values,'Empirical range upper': result.upper.values})
+                 st.download_button('Download baseline forecast · '+data.name(area),forecast.to_csv(index=False).encode(),f'{area}_{key}_baseline_forecast.csv','text/csv',key='baseline_download_'+area)
+                 with st.expander('Backtesting details · '+data.name(area)):
+@@ -337,7 +338,7 @@ def render_forecasts(data, selection, years):
+                     st.dataframe(forecast,hide_index=True,width='stretch')
+             else:
+                 st.warning('Forecast unavailable: '+result.reason)
+-            figure.update_layout(yaxis_title=spec['unit'],colorway=['#4338CA','#0369A1','#D97706'])
++            figure.update_layout(yaxis_title=spec['unit'],colorway=theme.AREA_COLORWAY)
+             st.plotly_chart(chart_layout(figure),width='stretch',key='baseline_forecast_'+area+'_'+key)
+             if p.source_url:
+                 st.link_button('Baseline source · '+data.name(area),p.source_url,width='stretch')
+diff --git a/release_integrity.json b/release_integrity.json
+index 2767c5d..59906f9 100644
+--- a/release_integrity.json
++++ b/release_integrity.json
+@@ -1,19 +1,21 @@
+ {
+-  ".streamlit/config.toml": "78e6891d2110e45257326c2b7b05def21cb7c2ec636a2e907129c117d380e06a",
+-  "app.py": "cb22e01bdac13b50167e651a13b78f44a37e15b6ffc4881e6be1d44779f6a236",
++  ".streamlit/config.toml": "085b5bc4ad2364e65e536872f52c05acce6196a28c2c370c1e0599468bcf6114",
++  "app.py": "f8a654963d2b01bdc6a229f17ad80fff22ce201cb9bc71435a21b0d17f34ee66",
+   "config/three_area_model.json": "30ba5710cad8b86c926d95bbafc63910cef4606e7bbad4f129bebd69bc7c770f",
+   "config/water_model_config.json": "4f294069d4c69a24dd41fe25e7a394381ee9fa090de2814c3ba0ee33f906de07",
+   "dashboard/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "dashboard/catalog.py": "2a52ec960e118a7d2fb2b01927247b5583da8667761705058d70830b9427ebb6",
+-  "dashboard/environmental_map.py": "e7fa937dc965de8ac504b85dbc1eb4b137092100f8a8cadfc33bbd2f0b8a8e44",
+-  "dashboard/geographic_intelligence.py": "f58be6a5a334d0a05f1561fb439a324565dd65c6111c1a31124c0feb92f70504",
+-  "dashboard/intelligence.py": "9280a736d5e753f5dbd9e86d7386655e0966c43044c09ad6468f96fbfa8927a8",
+-  "dashboard/monthly_analytics.py": "8df1c316b9c2ee82e6273c2c42c3c24de734796d833c73aab5f1d4b1ea9715dc",
+-  "dashboard/monthly_ui.py": "b8dc5e5958d2f129d5503c06d782aa6979996826fccfbf345ab4321c21da5944",
+-  "dashboard/style.css": "2be94c85b384996b0bea0040d047b69a3a17bb7049941a59618f8b371235334e",
++  "dashboard/environmental_map.py": "5f4c58a55a89417760eb19ac4c82fdacb616e58e51719a77c252a6e624b586e1",
++  "dashboard/geographic_intelligence.py": "f3915f95c3af56b7a825370fa1383777c7114a41d71cc11dfbd32bbbff4b8c83",
++  "dashboard/indi.py": "2ba40d10112f5075465940d7925d3ef441a10e2d9aa49240c083835c0a9711f0",
++  "dashboard/intelligence.py": "e6b23d43504f588603471d08de68f14e649a3c233d960cdd840b09bd93778759",
++  "dashboard/monthly_analytics.py": "da49d6baf9715482bbf24b677c12f6702754b19fdc7eced59a24c790f5ac1635",
++  "dashboard/monthly_ui.py": "6b15a676b49b25690eda7570c7da4c6734ef54ad01a0a38a61d60a98f6fc15db",
++  "dashboard/style.css": "87fc3197e0626a60a5b2f84fea0753bf9ffdf0422aa330ba71bd787ad5a7c808",
++  "dashboard/theme.py": "6f0e0b5d1585a10af41bc1e87ebe427d5f3ad19defb03850e42e1a8ec4848780",
+   "dashboard/three_area_data.py": "1620cadfe0bb159ca5fb59b3e83f090ae38cc10452b5c7e3f6f4f5e9a76b9934",
+-  "dashboard/water_quality.py": "a9d4cb2f15abd61c47e47f4f11a2a55ffc19c4c0496c3cfcc464f3d81f85a938",
+-  "dashboard/workspace.py": "4ec94fb934c197b5f85e77cf9bfc0be3e144749cc4b77c4591ba1224d71fcd9f",
++  "dashboard/water_quality.py": "7dc0eb87ab235a1b4f95d4f64451e6c8ead685c817c1b4deb6bca8329127118d",
++  "dashboard/workspace.py": "4254d0b8d27b289f638e2cfd126c60d95e61b69006d9dc177cfd99f330d3a074",
+   "data_monthly/facility_zone_a_unified.csv": "69979277f3584aabb79908c3c37f28dbcf503a3614d0d7dbe3964d76e5ef22dd",
+   "data_three_area/air_candidate_verification.csv": "97f3b23062706a76839d95e4fb76c536dddadaefa1c55ed2b659aab03ced7422",
+   "data_three_area/air_source_evidence.csv": "363d12d07669d62e84a9c3e72925f4f546a63e757545dbd68ed4e7ee828b160d",
+@@ -61,4 +63,4 @@
+   "tests/test_phase2.py": "4aaed30d6bb3641b39e37279973beb1deac723a3d5adc51dba8ef1bd046f346b",
+   "tests/test_phase4.py": "b7acb882dbf8f2f260604f2ea5ae70577261dcbcefaa4f0a9fd4501d55843d84",
+   "water_model/monthly_water.py": "4f085b4b8d9cf9f18c992379a86dc740e4018afd6a48f490fc86825e236b49f9"
+-}
+\ No newline at end of file
++}

@@ -1,0 +1,14 @@
+{
+  "title": "Nexora | Sustainable Facility & Estate Intelligence",
+  "description": "Nexora — Sustainable Facility & Estate Intelligence for energy, water, air quality, assets, and operations.",
+  "icons": {
+    "icon": "/favicon.png"
+  },
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

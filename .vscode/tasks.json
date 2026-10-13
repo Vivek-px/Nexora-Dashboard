@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Nexora: install",
+      "type": "shell",
+      "command": "npm install && python -m venv .venv && .venv/bin/python -m pip install -r backend/requirements.txt",
+      "windows": { "command": "npm install; py -3 -m venv .venv; .venv\\Scripts\\python.exe -m pip install -r backend\\requirements.txt" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Nexora: API server",
+      "type": "shell",
+      "command": ".venv/bin/python -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000 --reload",
+      "windows": { "command": ".venv\\Scripts\\python.exe -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000 --reload" },
+      "isBackground": true,
+      "problemMatcher": { "owner": "uvicorn", "pattern": { "regexp": "^x^" }, "background": { "beginsPattern": "Will watch|Started reloader", "endsPattern": "Application startup complete" } }
+    },
+    {
+      "label": "Nexora: dashboard (dev)",
+      "type": "shell",
+      "command": "npm run dashboard",
+      "isBackground": true,
+      "problemMatcher": { "owner": "vite", "pattern": { "regexp": "^x^" }, "background": { "beginsPattern": "VITE", "endsPattern": "Local:" } }
+    },
+    {
+      "label": "Nexora: run all",
+      "dependsOn": ["Nexora: API server", "Nexora: dashboard (dev)"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Nexora: backend tests",
+      "type": "shell",
+      "command": ".venv/bin/python -m pip install -q pytest && .venv/bin/python -m pytest backend/tests -q",
+      "windows": { "command": ".venv\\Scripts\\python.exe -m pip install -q pytest; .venv\\Scripts\\python.exe -m pytest backend/tests -q" },
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}
